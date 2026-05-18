@@ -6,10 +6,8 @@ scikit-learn==1.5.0
 # Deep learning
 torch==2.3.1
 
-# Approximate kNN for full-data LOF (optional but strongly recommended)
-# faiss-cpu speeds up LOF from O(n*k*log n) exact to O(nprobe*k) approximate.
-# Without it, LOF falls back to sklearn BallTree on full data (~5 min train, ~2s inference).
-faiss-cpu>=1.7.4
+# Approximate kNN for full-data LOF
+faiss-cpu==1.8.0
 
 # Explainability
 shap==0.45.1
@@ -25,8 +23,6 @@ streamlit==1.35.0
 # Utilities
 scipy==1.13.1
 
-# C-03: Screenshot OCR
+# OCR
 pillow>=10.0.0
 pytesseract>=0.3.10
-# System dep: tesseract-ocr binary required
-# Streamlit Cloud: add 'tesseract-ocr' to packages.txt
