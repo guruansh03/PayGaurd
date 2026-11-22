@@ -37,7 +37,28 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-_DB_PATH = os.path.join('outputs', 'velocity.db')
+_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'outputs', 'velocity.db')
+
+
+def to_unix_seconds(values) -> np.ndarray:
+    """
+    Convert timestamps (strings / datetimes / Series) to integer Unix seconds.
+
+    Resolution-safe: pandas 3 stores parsed datetimes at microsecond (or second)
+    resolution, so the old `.astype(np.int64) // 10**9` trick returned values
+    1000x too small and silently stretched every "1h" window to ~41 days.
+    Subtracting the epoch and dividing by a 1-second Timedelta is correct for
+    any resolution. Unparseable values map to 0.
+    """
+    ser = pd.Series(values)
+    if pd.api.types.is_datetime64_any_dtype(ser):
+        ts = ser
+    else:   # strings: pandas 3 infers ONE format from the first row -> mixed formats became NaT
+        ts = pd.to_datetime(ser, errors='coerce', format='mixed')
+    if getattr(ts.dt, 'tz', None) is not None:
+        ts = ts.dt.tz_convert('UTC').dt.tz_localize(None)
+    secs = (ts - pd.Timestamp('1970-01-01')) // pd.Timedelta(seconds=1)
+    return secs.fillna(0).astype(np.int64).to_numpy()
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS events (
@@ -188,7 +209,7 @@ class VelocityStore:
             df2['receiver_upi'] = df['receiver_upi'].values
         if has_amount:
             df2['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0).values
-        df2['ts'] = pd.to_datetime(df2['timestamp'], errors='coerce').astype(np.int64) // 10**9
+        df2['ts'] = to_unix_seconds(df2['timestamp'].values)
 
         v1h_out   = np.zeros(len(df2), dtype=np.int32)
         v24h_out  = np.zeros(len(df2), dtype=np.int32)

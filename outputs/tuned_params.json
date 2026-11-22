@@ -1,0 +1,21 @@
+{
+  "thresholds": {
+    "Isolation Forest": 0.69,
+    "Autoencoder": 0.27,
+    "LOF": 0.31,
+    "Ensemble": 0.28
+  },
+  "ensemble_weights": {
+    "if": 0.05,
+    "ae": 0.95,
+    "lof": 0.0
+  },
+  "val_f1": {
+    "Isolation Forest": 0.3304347826086957,
+    "Autoencoder": 0.7795371498172959,
+    "LOF": 0.10613810741687979,
+    "Ensemble": 0.7801932367149758
+  },
+  "tuned_on": "validation split",
+  "created_utc": "2026-11-22T19:57:40+00:00"
+}

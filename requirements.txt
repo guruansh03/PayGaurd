@@ -1,13 +1,13 @@
-numpy==2.4.3
-pandas==3.0.1
-scikit-learn==1.8.0
-torch==2.11.0
-faiss-cpu==1.12.0
-shap==0.45.1
-plotly==5.22.0
-matplotlib==3.9.0
-seaborn==0.13.2
-streamlit==1.56.0
-scipy==1.13.1
-pillow>=10.0.0
-pytesseract>=0.3.10
+# Runtime for the Streamlit dashboard (Streamlit Community Cloud installs this file).
+# Pinned to the versions the app was tested with on Python 3.12.
+# torch is NOT needed here: the autoencoder runs in NumPy from outputs/autoencoder_weights.npz.
+# To retrain the models: pip install -r requirements-train.txt
+streamlit==1.67.0
+numpy==2.5.5
+pandas==3.1.1
+scikit-learn==1.9.1
+scipy==1.18.1
+faiss-cpu==1.16.0
+plotly==7.1.0
+pillow==13.0.0
+pytesseract==0.3.13

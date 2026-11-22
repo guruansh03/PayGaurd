@@ -1,0 +1,7 @@
+# Everything needed to regenerate data, retrain, tune and rebuild charts (bash retrain.sh)
+-r requirements.txt
+torch==2.15.0
+shap==0.51.0
+matplotlib==3.11.2
+seaborn==0.13.2
+pytest==9.2.0

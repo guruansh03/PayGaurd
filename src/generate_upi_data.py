@@ -32,7 +32,9 @@ import hashlib
 import random
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import DATA_PATH, RANDOM_SEED
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import DATA_PATH, RANDOM_SEED, OUTPUTS_DIR
+from velocity_store import to_unix_seconds
 
 np.random.seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
@@ -193,28 +195,32 @@ for _ in range(per_pattern):
         'fraud':             1,
     })
 
-# Pattern 2: Rapid velocity
-for _ in range(per_pattern):
-    sender  = random.choice(sender_pool[:500])
+# Pattern 2: Rapid velocity -- real bursts.
+# Previously every row got an independent random timestamp, so no burst ever
+# existed inside a 1h window. Now: bursts of 5 txns from one sender within ~30 min.
+BURST = 5
+for _ in range(per_pattern // BURST):
+    sender  = random.choice(sender_pool)
     s_state = sender_home_state[sender]
     base_ts = _rand_ts()
-    ts      = base_ts + timedelta(minutes=np.random.randint(0, 30))
-    fraud_rows.append({
-        'txn_id':            _txn_id(),
-        'timestamp':         ts,
-        'sender_upi':        sender,
-        'receiver_upi':      _random_upi('mule'),
-        'amount':            round(np.random.uniform(500, 5000), 2),
-        'upi_app':           np.random.choice(UPI_APPS, p=APP_WEIGHTS),
-        'merchant_category': 'p2p',
-        'sender_bank':       sender_home_bank[sender],
-        'receiver_bank':     random.choice(BANKS),
-        'sender_state':      s_state,
-        'receiver_state':    random.choice(STATES),
-        'device_id':         device_pool[sender],
-        'is_new_device':     0,
-        'fraud':             1,
-    })
+    for j in range(BURST):
+        ts = base_ts + timedelta(minutes=int(j * np.random.randint(3, 7)))
+        fraud_rows.append({
+            'txn_id':            _txn_id(),
+            'timestamp':         ts,
+            'sender_upi':        sender,
+            'receiver_upi':      _random_upi('mule'),
+            'amount':            round(np.random.uniform(500, 5000), 2),
+            'upi_app':           np.random.choice(UPI_APPS, p=APP_WEIGHTS),
+            'merchant_category': 'p2p',
+            'sender_bank':       sender_home_bank[sender],
+            'receiver_bank':     random.choice(BANKS),
+            'sender_state':      s_state,
+            'receiver_state':    random.choice(STATES),
+            'device_id':         device_pool[sender],
+            'is_new_device':     0,
+            'fraud':             1,
+        })
 
 # Pattern 3: New device + high amount
 for _ in range(per_pattern):
@@ -361,7 +367,7 @@ df = df.sort_values('timestamp').reset_index(drop=True)
 
 # Time features
 df['txn_hour']   = df['timestamp'].dt.hour
-df['txn_day']    = df['timestamp'].dt.dayofweek
+df['txn_day']    = df['timestamp'].dt.day_of_week
 df['is_weekend'] = (df['txn_day'] >= 5).astype(int)
 df['is_night']   = ((df['txn_hour'] >= 23) | (df['txn_hour'] <= 4)).astype(int)
 
@@ -371,7 +377,7 @@ df['is_round_amount'] = (df['amount'] % 1000 == 0).astype(int)
 
 # Per-sender velocity (real time-windowed count)
 print("Computing per-sender velocity (slow step, ~30s)...")
-df['txn_ts_unix'] = df['timestamp'].astype(np.int64) // 10**9
+df['txn_ts_unix'] = to_unix_seconds(df['timestamp'])  # resolution-safe (pandas 3)
 velocity_1h         = np.zeros(len(df), dtype=np.int32)
 velocity_24h        = np.zeros(len(df), dtype=np.int32)
 unique_receivers_1h = np.zeros(len(df), dtype=np.int32)   # IMP-03
@@ -469,29 +475,15 @@ device_registry = (
     .apply(set)
     .to_dict()
 )
-os.makedirs('outputs', exist_ok=True)
-with open('outputs/device_registry.pkl', 'wb') as _f:
+os.makedirs(OUTPUTS_DIR, exist_ok=True)
+with open(os.path.join(OUTPUTS_DIR, 'device_registry.pkl'), 'wb') as _f:
     _pkl.dump(device_registry, _f)
 n_senders = len(device_registry)
 n_devices = sum(len(v) for v in device_registry.values())
 print(f"Device registry saved -> outputs/device_registry.pkl  ({n_senders:,} senders, {n_devices:,} devices)")
 
-# IMP-01: Save receiver_stats.csv for Option B inference lookup
-# Contains precomputed 24h window stats per receiver from training data.
-# encode_raw_df() loads this at inference time -- missing receiver -> 0 (new, suspicious).
-receiver_stats = (
-    df.groupby('receiver_upi')
-    .agg(
-        receiver_txn_count_24h_mean=('receiver_txn_count_24h', 'mean'),
-        receiver_amount_sum_24h_mean=('receiver_amount_sum_24h', 'mean'),
-        receiver_txn_count_24h_max=('receiver_txn_count_24h', 'max'),
-        receiver_amount_sum_24h_max=('receiver_amount_sum_24h', 'max'),
-    )
-    .reset_index()
-)
-receiver_stats_path = os.path.join('outputs', 'receiver_stats.csv')
-receiver_stats.to_csv(receiver_stats_path, index=False)
-print(f"Receiver stats saved -> {receiver_stats_path}  ({len(receiver_stats):,} receivers)")
+# receiver_stats.csv is written by data_processing.py from the TRAINING split only
+# (writing it here from the full dataset leaked val/test rows into inference lookups).
 
 fraud_rate = df['fraud'].mean() * 100
 print(f"\nDataset saved -> {DATA_PATH}")

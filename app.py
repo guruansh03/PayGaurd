@@ -24,6 +24,7 @@ from config import (
     AE_MODEL_PATH, AE_SCALER_PATH, AE_MSE_SCALER_PATH,
     AE_HIDDEN, OUTPUTS_DIR, RANDOM_SEED,
     LOF_MODEL_PATH, LOF_SCALER_PATH,
+    MODEL_THRESHOLDS, METRICS_PATH, TUNED,
 )
 
 log = logging.getLogger(__name__)
@@ -585,6 +586,12 @@ UPI_APPS      = ['GPay','PhonePe','Paytm','BHIM','AmazonPay','WhatsApp']
 BANKS         = ['SBI','HDFC','ICICI','Axis','Kotak','PNB','BOB','Canara','IndusInd','Yes Bank','IDFC First','UCO Bank']
 STATES        = ['Maharashtra','Karnataka','Delhi','Tamil Nadu','Telangana','Gujarat','Rajasthan','UP','West Bengal','Kerala','MP','Bihar','Odisha','Punjab','Haryana']
 MERCHANT_CATS = ['p2p','food','utilities','groceries','fuel','recharge','ecommerce','rent','education']
+# Must equal src/data_processing.FEATURE_COLS (same order) -- models read features by position.
+FEATURE_COLS  = ['amount','amount_log','amount_vs_sender_avg','is_round_amount',
+                 'txn_hour','txn_day','is_weekend','is_night','velocity_1h','velocity_24h',
+                 'is_new_device','cross_bank','cross_state','upi_app_enc','merchant_cat_enc',
+                 'sender_bank_enc','receiver_bank_enc','sender_state_enc','receiver_state_enc',
+                 'unique_receivers_1h','amount_entropy_1h','receiver_txn_count_24h','receiver_amount_sum_24h']
 
 # ── Sidebar ──
 with st.sidebar:
@@ -672,7 +679,7 @@ with st.sidebar:
     st.markdown(f"<p style='font-size:9px;color:#888;letter-spacing:.08em;text-transform:uppercase;margin-top:4px'>Active: {THEMES[_theme]['label']}</p>", unsafe_allow_html=True)
     st.divider()
     st.markdown("<p class='section-header'>Settings</p>", unsafe_allow_html=True)
-    model_choice = st.selectbox('Model', ['Isolation Forest','Autoencoder','LOF','Ensemble'])
+    model_choice = st.selectbox('Model', ['Isolation Forest','Autoencoder','LOF','Ensemble'], index=3)
     _model_defaults = {
         'Isolation Forest': IF_THRESHOLD,
         'Autoencoder':      AE_THRESHOLD,
@@ -687,32 +694,7 @@ with st.sidebar:
     st.markdown("<p style='color:#6B7280;font-size:0.65rem'>Presentation build · Local analytics workspace</p>", unsafe_allow_html=True)
 
 
-# ── Cached loaders ──
-@st.cache_resource
-def load_if_model():
-    import pickle
-    with open(IF_MODEL_PATH, 'rb') as f: model = pickle.load(f)
-    with open(IF_SCALER_PATH, 'rb') as f: scaler = pickle.load(f)
-    return model, scaler
-
-@st.cache_resource
-def load_ae_model(input_dim):
-    import pickle, torch
-    from src.models import Autoencoder
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ae = Autoencoder(input_dim, AE_HIDDEN).to(device)
-    ae.load_state_dict(torch.load(AE_MODEL_PATH, map_location=device, weights_only=True))
-    ae.eval()
-    with open(AE_SCALER_PATH, 'rb') as f: scaler = pickle.load(f)
-    return ae, scaler, device
-
-@st.cache_resource
-def load_lof_model():
-    import pickle
-    with open(LOF_MODEL_PATH, 'rb') as f: lof_model = pickle.load(f)
-    with open(LOF_SCALER_PATH, 'rb') as f: scaler = pickle.load(f)
-    return lof_model, scaler
-
+# ── Cached loaders (model inference itself lives in src/models.py) ──
 @st.cache_data
 def load_sender_stats():
     if os.path.exists(SENDER_STATS_PATH):
@@ -763,8 +745,13 @@ def encode_raw_df(df: pd.DataFrame) -> pd.DataFrame:
     out['amount']     = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
     out['amount_log'] = np.log1p(out['amount'])
     sender_stats = load_sender_stats()
-    historical_global_mean = sender_stats['amount_mean'].mean() if sender_stats is not None and len(sender_stats) > 0 else 1.0
-    global_mean = out['amount'].mean() if len(out) > 1 else historical_global_mean
+    # Unknown senders get the overall TRAINING mean amount -- same rule as data_processing.py
+    if sender_stats is not None and len(sender_stats) > 0 and 'txn_count' in sender_stats.columns:
+        global_mean = float((sender_stats['amount_mean'] * sender_stats['txn_count']).sum() / sender_stats['txn_count'].sum())
+    elif sender_stats is not None and len(sender_stats) > 0:
+        global_mean = float(sender_stats['amount_mean'].mean())
+    else:
+        global_mean = float(out['amount'].mean()) if len(out) else 1.0
     if sender_stats is not None and 'sender_upi' in df.columns:
         known_avg = df['sender_upi'].map(sender_stats['amount_mean'])
         sender_avg = known_avg.fillna(global_mean)
@@ -775,9 +762,9 @@ def encode_raw_df(df: pd.DataFrame) -> pd.DataFrame:
     out['amount_vs_sender_avg'] = out['amount'] / (pd.to_numeric(sender_avg, errors='coerce').fillna(global_mean) + 1)
     out['is_round_amount'] = (out['amount'] % 1000 == 0).astype(int)
     try:
-        ts = pd.to_datetime(df['timestamp'])
-        out['txn_hour'] = ts.dt.hour
-        out['txn_day']  = ts.dt.dayofweek
+        ts = pd.to_datetime(df['timestamp'], errors='coerce', format='mixed')
+        out['txn_hour'] = ts.dt.hour.fillna(12).astype(int)
+        out['txn_day']  = ts.dt.day_of_week.fillna(0).astype(int)
     except Exception:
         out['txn_hour'] = 12
         out['txn_day']  = 0
@@ -836,6 +823,7 @@ def encode_raw_df(df: pd.DataFrame) -> pd.DataFrame:
     out = out.fillna(0)
     _SCALE_COLS = ['amount','amount_log','amount_vs_sender_avg','velocity_1h','velocity_24h','txn_hour','txn_day','unique_receivers_1h','amount_entropy_1h','receiver_txn_count_24h','receiver_amount_sum_24h']
     feat_scaler = load_feature_scaler()
+    out = out[FEATURE_COLS].astype(float)   # training column order (was a different order -> wrong slots)
     if feat_scaler is not None:
         out[_SCALE_COLS] = feat_scaler.transform(out[_SCALE_COLS])
     return out
@@ -877,7 +865,8 @@ def dataset_split_counts(test_count: int):
 @st.cache_data(show_spinner=False)
 def cached_inference(feature_df_json: str, model_name: str, threshold: float):
     from src.models import run_inference
-    feature_df = pd.read_json(feature_df_json, dtype=float)
+    import io
+    feature_df = pd.read_json(io.StringIO(feature_df_json), dtype=float)   # pandas 3: literal JSON must be wrapped
     return run_inference(feature_df, model_name=model_name, threshold=threshold)
 
 def light_chart(fig, height=400):
@@ -1388,6 +1377,9 @@ elif page == '📤 Scan':
                 feature_df = encode_raw_df(source_df) if raw_mode else source_df.copy()
                 result = cached_inference(feature_df.to_json(double_precision=15), model_name=model_choice, threshold=threshold)
                 display_df = source_df.copy()
+                if not raw_mode and 'amount' in display_df.columns:
+                    # pre-processed rows hold the STANDARDISED amount -> show / sum real INR
+                    display_df['amount'] = np.round(_inverse_scale_amount(display_df['amount'].values), 2)
                 display_df['anomaly_score'] = result['anomaly_score'].values
                 display_df['is_fraud']      = result['is_fraud'].values
                 n_fraud = int(display_df['is_fraud'].sum())
@@ -1398,11 +1390,11 @@ elif page == '📤 Scan':
                 c2.metric('Flagged as Fraud', f'{n_fraud:,}')
                 c3.metric('Flag Rate', f'{n_fraud/n_total*100:.2f}%')
                 c4.metric('Amount at Risk', format_inr(flagged_amt))
-                st.markdown("#### Model Comparison (same data, same threshold)")
+                st.markdown("#### Model Comparison (same data, each model at its tuned threshold)")
                 comp_cols = st.columns(3)
                 for i, mn in enumerate(['Isolation Forest','Autoencoder','LOF']):
                     try:
-                        r2 = cached_inference(feature_df.to_json(double_precision=15), model_name=mn, threshold=threshold)
+                        r2 = cached_inference(feature_df.to_json(double_precision=15), model_name=mn, threshold=MODEL_THRESHOLDS[mn])
                         nf = int(r2['is_fraud'].sum())
                         comp_cols[i].metric(mn, f'{nf:,} flagged', f"{nf/n_total*100:.2f}%")
                     except Exception as e:
@@ -1459,10 +1451,11 @@ elif page == '📊 Analytics':
             rows = []
             for name, col in SCORE_MAP.items():
                 if col in scores.columns:
-                    yp = (scores[col] >= threshold).astype(int)
+                    _thr = MODEL_THRESHOLDS.get(name, threshold)   # each model on its own tuned threshold
+                    yp = (scores[col] >= _thr).astype(int)
                     try: auc = roc_auc_score(y_true, scores[col])
                     except: auc = 0
-                    rows.append({'Model':name,'Flagged':int(yp.sum()),'Flag Rate':f"{yp.mean()*100:.2f}%",'Precision':f"{precision_score(y_true,yp,zero_division=0):.3f}",'Recall':f"{recall_score(y_true,yp,zero_division=0):.3f}",'F1':f"{f1_score(y_true,yp,zero_division=0):.3f}",'ROC-AUC':f"{auc:.4f}"})
+                    rows.append({'Model':name,'Threshold':f"{_thr:.2f}",'Flagged':int(yp.sum()),'Flag Rate':f"{yp.mean()*100:.2f}%",'Precision':f"{precision_score(y_true,yp,zero_division=0):.3f}",'Recall':f"{recall_score(y_true,yp,zero_division=0):.3f}",'F1':f"{f1_score(y_true,yp,zero_division=0):.3f}",'ROC-AUC':f"{auc:.4f}"})
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             st.divider()
             st.markdown("### ROC Curves")
@@ -1845,7 +1838,7 @@ For screenshots, use the quick-fill scenarios, click **Score this transaction**,
                 except ImportError:
                     from models import run_inference
 
-                _model_thresholds = {'Isolation Forest':IF_THRESHOLD,'Autoencoder':AE_THRESHOLD,'LOF':LOF_THRESHOLD,'Ensemble':THRESHOLD}
+                _model_thresholds = MODEL_THRESHOLDS
                 all_results = {}
                 for mn in ['Isolation Forest','Autoencoder','LOF','Ensemble']:
                     try:
@@ -2026,7 +2019,12 @@ Unsupervised models learn *normal behaviour* — anything outside gets flagged, 
 
     st.markdown("### Models")
     m1,m2,m3 = st.columns(3)
-    for col, icon, name, auc, desc in zip([m1,m2,m3],['🌲','🧠','🔵'],['Isolation Forest','Autoencoder','LOF'],['0.9413','0.9329','0.8624'],['Tree-based outlier detection','Neural reconstruction error','Local density anomaly scoring']):
+    try:
+        with open(METRICS_PATH) as _mf: _mjson = json.load(_mf)['models']
+        _aucs = [f"{_mjson[n]['roc_auc']:.4f}" for n in ['Isolation Forest','Autoencoder','LOF']]
+    except Exception:
+        _aucs = ['n/a','n/a','n/a']
+    for col, icon, name, auc, desc in zip([m1,m2,m3],['🌲','🧠','🔵'],['Isolation Forest','Autoencoder','LOF'],_aucs,['Tree-based outlier detection','Neural reconstruction error','Local density anomaly scoring']):
         with col:
             st.markdown(f"<div class='stat-card'><div style='font-size:2rem'>{icon}</div><div style='font-weight:700;margin:8px 0 4px'>{name}</div><div style='font-family:monospace;font-size:1.2rem'>ROC-AUC {auc}</div><div style='font-size:0.8rem;margin:4px 0'>{desc}</div></div>", unsafe_allow_html=True)
     st.divider()

@@ -2,23 +2,27 @@
 models.py
 Three unsupervised anomaly detectors + weighted ensemble:
   1. Isolation Forest  -- tree-based outlier scoring
-  2. LOF               -- Local Outlier Factor (C-02: replaced DBSCAN)
-  3. Autoencoder       -- PyTorch; high reconstruction error = anomaly
-  4. Ensemble          -- weighted combination (FIX 9.5)
+  2. LOF               -- Local Outlier Factor on FAISS approximate kNN
+  3. Autoencoder       -- PyTorch for training; NumPy forward pass for inference
+  4. Ensemble          -- weighted combination; weights tuned on the VAL split (src/tune.py)
 
-C-01: AE_HIDDEN=[32,16,8,16,32] -- bottleneck=8 (42% of 19 dims, was 4/21%).
-      Wider bottleneck -> better recall for subtle fraud.
-      REQUIRED: delete outputs/autoencoder.pt + autoencoder_mse_scaler.pkl before retrain.
-      REQUIRED: recalibrate AE_THRESHOLD after retrain (MSE distribution shifts).
+Score convention for every model: higher = more anomalous, normalised to [0, 1]
+with a MinMaxScaler fitted on TRAINING scores only, then clipped.
 
-C-02: LOF replaces DBSCAN.
-      DBSCAN AUC=0.7888, precision=0.073 -- fraud geometrically spread across clusters.
-      LOF compares local density to neighbours -- correct algorithm for this geometry.
-      novelty=True required for inference on unseen data.
-      Score direction: decision_function() returns (−∞,1], negated before scaling.
-      Speed: FAISS approximate kNN when available; no 50k training cap.
-
-Phase 0/2/Audit fixes carried forward.
+Audit fixes in this version
+  - IF score scaler was fitted on TEST scores (leak + different scale from AE/LOF).
+    Now fitted on training scores, same as LOF and AE.
+  - LOF dropped the nearest neighbour for every query point. That is only correct
+    when the query set IS the fitted set (a point is its own neighbour). For new
+    points (val/test/live) it threw away the true nearest neighbour. Now handled
+    with an explicit exclude_self flag.
+  - LOF model is saved as a plain dict (no class pickling), so it loads from any
+    entry point (script, pytest, streamlit). Legacy pickles still load.
+    The FAISS index already stores the vectors, so X_fit is no longer duplicated
+    in the file when FAISS is used (~halves the file size).
+  - Autoencoder inference runs in NumPy from outputs/autoencoder_weights.npz,
+    so the deployed dashboard does not need torch (too large for Streamlit Cloud).
+    torch is only imported when training or computing saliency.
 """
 
 import os
@@ -29,28 +33,29 @@ import functools
 import numpy as np
 import pandas as pd
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-
 from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import MinMaxScaler
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     CONTAMINATION, RANDOM_SEED, OUTPUTS_DIR,
     IF_MODEL_PATH, IF_SCALER_PATH,
-    AE_MODEL_PATH, AE_SCALER_PATH, AE_MSE_SCALER_PATH,
+    AE_MODEL_PATH, AE_WEIGHTS_PATH, AE_SCALER_PATH, AE_MSE_SCALER_PATH,
     ANOMALY_SCORES_PATH,
     AE_EPOCHS, AE_BATCH_SIZE, AE_LR, AE_HIDDEN,
     AE_EARLY_STOP_PATIENCE,
     ENSEMBLE_WEIGHTS,
-    LOF_N_NEIGHBORS, LOF_ALGORITHM, LOF_MODEL_PATH, LOF_SCALER_PATH,
+    LOF_N_NEIGHBORS, LOF_MODEL_PATH, LOF_SCALER_PATH,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
 log = logging.getLogger(__name__)
+
+MODEL_NAMES = ['Isolation Forest', 'Autoencoder', 'LOF', 'Ensemble']
+
+
+def _minmax_apply(scaler, raw):
+    return np.clip(scaler.transform(np.asarray(raw).reshape(-1, 1)).ravel(), 0.0, 1.0)
 
 
 # ─── Isolation Forest ────────────────────────────────────────────────────────
@@ -63,12 +68,16 @@ def train_isolation_forest(X_train, X_test):
         n_estimators=100,
         n_jobs=-1,
     )
+    X_train = np.asarray(X_train, dtype=np.float32)   # numpy in, numpy at inference (no name warnings)
+    X_test = np.asarray(X_test, dtype=np.float32)
     model.fit(X_train)
 
-    raw_scores = -model.decision_function(X_test)
+    # Score scaler fitted on TRAINING scores (was: fitted on test scores -> leak)
+    raw_train = -model.decision_function(X_train)
+    scaler = MinMaxScaler().fit(raw_train.reshape(-1, 1))
 
-    scaler = MinMaxScaler()
-    scores_norm = scaler.fit_transform(raw_scores.reshape(-1, 1)).ravel()
+    raw_test = -model.decision_function(X_test)
+    scores_norm = _minmax_apply(scaler, raw_test)
 
     with open(IF_MODEL_PATH, 'wb') as f:
         pickle.dump(model, f)
@@ -80,390 +89,353 @@ def train_isolation_forest(X_train, X_test):
     return scores_norm
 
 
-# ─── LOF (C-02: replaces DBSCAN) ─────────────────────────────────────────────
-
-# ---------------------------------------------------------------------------
-# ApproximateLOF — FAISS-backed LOF that scales to 200k+ rows.
+# ─── LOF on approximate kNN ──────────────────────────────────────────────────
 #
-# Why not vanilla sklearn LOF on full data?
-#   sklearn LOF builds an exact ball-tree; kneighbors queries at inference are
-#   O(n * k * log n) over ALL stored training points. At 200k rows and k=20
-#   that is ~800k distance evaluations per query row — slow at inference time.
+# LOF(x) = mean over k neighbours o of lrd(o) / lrd(x)
+# lrd(x) = 1 / mean(reach_dist(x, o)),  reach_dist(x, o) = max(k_dist(o), d(x, o))
 #
-# Strategy: FAISS IVFFlat index (inverted-file approximate NN).
-#   - Fits on ALL training rows — no subsampling, no quality loss.
-#   - Builds a compressed index (nlist centroids) so query is O(nprobe * k)
-#     instead of O(n * k). 100-1000x faster at inference for 200k+ datasets.
-#   - LOF scores computed manually: lrd(x) / mean(lrd(neighbours)).
-#     Same math as sklearn LOF, approximate neighbours only.
-#   - Falls back to sklearn LOF on full data if faiss unavailable.
-#     sklearn on 200k still works — takes ~5 min to train, ~2s per inference
-#     call (acceptable for batch scoring; slow for live single-row scoring).
-# ---------------------------------------------------------------------------
+# FAISS IVFFlat gives approximate neighbours in O(nprobe * k) per query, so all
+# training rows are used (no subsampling). Falls back to an exact BallTree.
 
-def _lof_scores_from_knn(X_fit: np.ndarray, X_query: np.ndarray, k: int):
-    """
-    Compute LOF scores given a pre-built kNN structure.
-    Works with any kNN backend that returns (distances, indices).
-    Returns raw LOF scores (higher = more anomalous, >1 means outlier).
-    """
+def _make_knn(X_fit32):
+    """Return (knn_query(X, k, exclude_self) -> (dist, idx), faiss_index_or_None)."""
     try:
         import faiss
-        _use_faiss = True
     except ImportError:
-        _use_faiss = False
+        faiss = None
 
-    X_fit32   = X_fit.astype(np.float32)
-    X_query32 = X_query.astype(np.float32)
     n, d = X_fit32.shape
-
-    if _use_faiss:
-        # Normalize for cosine-style distance; L2 on unit sphere = 1 - cosine
-        # For tabular fraud data we keep L2 (no normalization needed).
-        nlist = max(4, int(np.sqrt(n)))          # number of Voronoi cells
-        nprobe = max(1, nlist // 10)              # cells to search at query time
+    if faiss is not None:
+        nlist = max(4, int(np.sqrt(n)))
         quantizer = faiss.IndexFlatL2(d)
         index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
         index.train(X_fit32)
         index.add(X_fit32)
-        index.nprobe = nprobe
-        log.info(f"FAISS IVFFlat: nlist={nlist}, nprobe={nprobe}, n={n:,}, d={d}")
+        index.nprobe = max(1, nlist // 10)
+        log.info(f"FAISS IVFFlat: nlist={nlist}, nprobe={index.nprobe}, n={n:,}, d={d}")
+        return _faiss_query_fn(index), index
 
-        def knn_query(X_q, n_neighbors):
-            # k+1 because a point is its own neighbour in the training set
-            D, I = index.search(X_q, n_neighbors + 1)
-            # Distances are squared L2; convert to L2
-            return np.sqrt(np.clip(D[:, 1:], 0, None)), I[:, 1:]
+    log.info("faiss not available -- using sklearn BallTree (exact, slower)")
+    from sklearn.neighbors import BallTree
+    tree = BallTree(X_fit32, leaf_size=40)
 
-    else:
-        # Pure sklearn fallback — exact kNN, no FAISS
-        log.info("faiss not available — using sklearn BallTree (exact, slower)")
-        from sklearn.neighbors import BallTree
-        tree = BallTree(X_fit32, leaf_size=40)
+    def knn_query(X_q, k, exclude_self=False):
+        D, I = tree.query(np.asarray(X_q, dtype=np.float32), k=k + int(exclude_self))
+        return (D[:, 1:], I[:, 1:]) if exclude_self else (D, I)
+    return knn_query, None
 
-        def knn_query(X_q, n_neighbors):
-            D, I = tree.query(X_q, k=n_neighbors + 1)
-            return D[:, 1:], I[:, 1:]
 
-    # ── reach-distance & lrd on training set (needed for lrd of query pts) ──
-    dist_fit, idx_fit = knn_query(X_fit32, k)
-    k_dist_fit = dist_fit[:, -1]                  # k-th NN distance per point
-    # reach_dist[i, j] = max(k_dist(neighbour_j), dist(i, neighbour_j))
-    reach_dist_fit = np.maximum(dist_fit, k_dist_fit[idx_fit])
-    lrd_fit = 1.0 / (np.mean(reach_dist_fit, axis=1) + 1e-10)
+def _faiss_query_fn(index):
+    def knn_query(X_q, k, exclude_self=False):
+        D, I = index.search(np.ascontiguousarray(X_q, dtype=np.float32), k + int(exclude_self))
+        D = np.sqrt(np.clip(D, 0, None))            # FAISS returns squared L2
+        if exclude_self:
+            D, I = D[:, 1:], I[:, 1:]
+        # IVF can return -1 when a probed cell has fewer than k points; reuse nearest valid
+        if (I < 0).any():
+            bad = I < 0
+            I = np.where(bad, I[:, :1], I)
+            D = np.where(bad, D[:, :1], D)
+        return D, I
+    return knn_query
 
-    def _lof(X_q):
-        dist_q, idx_q = knn_query(X_q, k)
-        k_dist_q = dist_q[:, -1]
-        reach_dist_q = np.maximum(dist_q, k_dist_fit[idx_q])
-        lrd_q = 1.0 / (np.mean(reach_dist_q, axis=1) + 1e-10)
-        lof_q = np.mean(lrd_fit[idx_q] / lrd_q[:, np.newaxis], axis=1)
-        return lof_q
 
-    # Chunk queries to avoid OOM on very large sets
+def _lof_from_neighbours(dist_q, idx_q, k_dist_fit, lrd_fit):
+    reach = np.maximum(dist_q, k_dist_fit[idx_q])
+    lrd_q = 1.0 / (reach.mean(axis=1) + 1e-10)
+    return (lrd_fit[idx_q] / lrd_q[:, None]).mean(axis=1)
+
+
+def _fit_lof_stats(knn_query, X_fit32, k, chunk=10_000):
+    """k-distance and lrd of every training point (self excluded from its own neighbours)."""
+    n = len(X_fit32)
+    dist = np.empty((n, k), dtype=np.float32)
+    idx = np.empty((n, k), dtype=np.int64)
+    for i in range(0, n, chunk):
+        dist[i:i + chunk], idx[i:i + chunk] = knn_query(X_fit32[i:i + chunk], k, exclude_self=True)
+    k_dist_fit = dist[:, -1]
+    reach = np.maximum(dist, k_dist_fit[idx])
+    lrd_fit = 1.0 / (reach.mean(axis=1) + 1e-10)
+    return k_dist_fit, lrd_fit, dist, idx
+
+
+def _lof_scores_from_knn(X_fit: np.ndarray, X_query: np.ndarray, k: int):
+    """
+    Raw LOF scores for training points and for NEW query points.
+    Returns (lof_train, lof_query, faiss_index_or_None, knn_query).
+    Higher = more anomalous; ~1 for inliers.
+    """
+    X_fit32 = np.ascontiguousarray(X_fit, dtype=np.float32)
+    X_q32 = np.ascontiguousarray(X_query, dtype=np.float32)
+    knn_query, index = _make_knn(X_fit32)
+    k_dist_fit, lrd_fit, dist_fit, idx_fit = _fit_lof_stats(knn_query, X_fit32, k)
+
+    lof_train = _lof_from_neighbours(dist_fit, idx_fit, k_dist_fit, lrd_fit)
     CHUNK = 10_000
-    lof_train = np.concatenate([_lof(X_fit32[i:i+CHUNK]) for i in range(0, n, CHUNK)])
-    lof_test  = np.concatenate([_lof(X_query32[i:i+CHUNK]) for i in range(0, len(X_query32), CHUNK)])
-
-    return lof_train, lof_test, index if _use_faiss else None, knn_query
+    lof_q = []
+    for i in range(0, len(X_q32), CHUNK):
+        d, ix = knn_query(X_q32[i:i + CHUNK], k, exclude_self=False)   # new points: keep nearest
+        lof_q.append(_lof_from_neighbours(d, ix, k_dist_fit, lrd_fit))
+    lof_query = np.concatenate(lof_q) if lof_q else np.empty(0)
+    return lof_train, lof_query, index, knn_query
 
 
 class ApproximateLOFModel:
     """
-    Pickle-able wrapper that stores the FAISS index (or sklearn BallTree)
-    + training lrd values so inference can be run on new data.
-    Matches the sklearn LOF decision_function() interface:
-        decision_function(X) -> array of shape (n,)
-        Values in (-inf, 1]. More negative = more anomalous.
+    Inference wrapper. decision_function(X) follows the sklearn convention:
+    values in (-inf, 1], more negative = more anomalous.
     """
-    def __init__(self, lrd_fit, idx_fit_knn_query_fn, k, X_fit, use_faiss):
-        self.k = k
-        self.lrd_fit = lrd_fit          # shape (n_train,)
-        self.X_fit   = X_fit            # float32 array, stored for BallTree fallback
-        self.use_faiss = use_faiss
-        # Store raw index bytes for FAISS (faiss objects aren't picklable directly)
-        if use_faiss:
-            import faiss, io
-            buf = faiss.serialize_index(idx_fit_knn_query_fn)
-            self.faiss_index_bytes = np.frombuffer(buf, dtype=np.uint8)
-        else:
-            self.faiss_index_bytes = None
-        self._knn_query = None          # rebuilt lazily on first call
+    def __init__(self, k, lrd_fit, k_dist_fit, faiss_index_bytes=None, X_fit=None):
+        self.k = int(k)
+        self.lrd_fit = np.asarray(lrd_fit)
+        self._k_dist_fit = np.asarray(k_dist_fit)
+        self.faiss_index_bytes = faiss_index_bytes
+        self.X_fit = X_fit                       # only kept for the BallTree fallback
+        self.use_faiss = faiss_index_bytes is not None
+        self._knn_query = None
+
+    # -- persistence (plain dict: loads from any entry point) --
+    def to_state(self):
+        return {
+            'format': 'payguard-lof-v2',
+            'k': self.k,
+            'lrd_fit': self.lrd_fit,
+            'k_dist_fit': self._k_dist_fit,
+            'faiss_index_bytes': self.faiss_index_bytes,
+            'X_fit': None if self.use_faiss else self.X_fit,
+        }
+
+    @classmethod
+    def from_state(cls, st):
+        return cls(st['k'], st['lrd_fit'], st['k_dist_fit'], st.get('faiss_index_bytes'), st.get('X_fit'))
 
     def _build_query_fn(self):
         if self.use_faiss:
             import faiss
-            buf = self.faiss_index_bytes.tobytes()
-            index = faiss.deserialize_index(np.frombuffer(buf, dtype=np.uint8))
+            index = faiss.deserialize_index(np.asarray(self.faiss_index_bytes, dtype=np.uint8))
             index.nprobe = max(1, index.nlist // 10)
-            k = self.k
-            def knn_query(X_q, n_neighbors):
-                D, I = index.search(X_q.astype(np.float32), n_neighbors + 1)
-                return np.sqrt(np.clip(D[:, 1:], 0, None)), I[:, 1:]
+            self._knn_query = _faiss_query_fn(index)
         else:
             from sklearn.neighbors import BallTree
-            tree = BallTree(self.X_fit, leaf_size=40)
-            def knn_query(X_q, n_neighbors):
-                D, I = tree.query(X_q.astype(np.float32), k=n_neighbors + 1)
-                return D[:, 1:], I[:, 1:]
-        self._knn_query = knn_query
+            tree = BallTree(np.asarray(self.X_fit, dtype=np.float32), leaf_size=40)
+
+            def knn_query(X_q, k, exclude_self=False):
+                D, I = tree.query(np.asarray(X_q, dtype=np.float32), k=k + int(exclude_self))
+                return (D[:, 1:], I[:, 1:]) if exclude_self else (D, I)
+            self._knn_query = knn_query
 
     def decision_function(self, X):
-        """sklearn-compatible: returns values in (-inf, 1]. Negate for anomaly score."""
         if self._knn_query is None:
             self._build_query_fn()
-        X32 = np.asarray(X, dtype=np.float32)
-        k = self.k
-        lrd_fit = self.lrd_fit
-        CHUNK = 10_000
-        lof_scores = []
-        for i in range(0, len(X32), CHUNK):
-            Xc = X32[i:i+CHUNK]
-            dist_q, idx_q = self._knn_query(Xc, k)
-            reach_dist_q = np.maximum(dist_q, self._k_dist_fit[idx_q])
-            lrd_q = 1.0 / (np.mean(reach_dist_q, axis=1) + 1e-10)
-            lof_q = np.mean(lrd_fit[idx_q] / lrd_q[:, np.newaxis], axis=1)
-            lof_scores.append(lof_q)
-        lof = np.concatenate(lof_scores)
-        # Convert to sklearn decision_function convention: 1 - lof (>0 = inlier)
+        X32 = np.ascontiguousarray(X, dtype=np.float32)
+        out = []
+        for i in range(0, len(X32), 10_000):
+            d, ix = self._knn_query(X32[i:i + 10_000], self.k, exclude_self=False)
+            out.append(_lof_from_neighbours(d, ix, self._k_dist_fit, self.lrd_fit))
+        lof = np.concatenate(out) if out else np.empty(0)
         return 1.0 - lof
 
-    def fit_store_kdist(self, k_dist_fit):
-        """Store k-distances of training points (needed for reach-distance at inference)."""
-        self._k_dist_fit = k_dist_fit
+    # legacy-pickle compatibility (older files pickled the object itself)
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__dict__.setdefault('_knn_query', None)
+        if 'use_faiss' not in self.__dict__:
+            self.use_faiss = self.__dict__.get('faiss_index_bytes') is not None
+
+
+def save_lof_model(model: ApproximateLOFModel, path=LOF_MODEL_PATH):
+    with open(path, 'wb') as f:
+        pickle.dump(model.to_state(), f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_lof_model(path=LOF_MODEL_PATH) -> ApproximateLOFModel:
+    import types
+    # Legacy files pickled `__main__.ApproximateLOFModel`; make that name resolvable.
+    main = sys.modules.setdefault('__main__', types.ModuleType('__main__'))
+    if not hasattr(main, 'ApproximateLOFModel'):
+        main.ApproximateLOFModel = ApproximateLOFModel
+    with open(path, 'rb') as f:
+        obj = pickle.load(f)
+    if isinstance(obj, dict) and obj.get('format') == 'payguard-lof-v2':
+        return ApproximateLOFModel.from_state(obj)
+    return obj
 
 
 def train_lof(X_train, X_test):
-    """
-    C-02: Local Outlier Factor — full-data training via FAISS approximate kNN.
-
-    Key implementation notes:
-    - novelty=True equivalent: ApproximateLOFModel.decision_function() works on unseen data.
-    - Score direction: decision_function() returns (−∞, 1].
-      More negative = more anomalous. Negate before scaling so higher = more anomalous.
-    - Speed: FAISS IVFFlat index trained on ALL rows. Query is O(nprobe * k) not O(n * k).
-      200k rows, k=20, nprobe=sqrt(n)/10: ~0.3s per 1k queries vs ~5s with sklearn exact kNN.
-    - Falls back to sklearn LOF on full data if faiss not installed.
-    - Scaler fitted on training scores (same pattern as IF).
-    - NO subsampling: all training rows used.
-    """
     log.info("=== LOF (full-data, approximate kNN) ===")
-
-    X_fit = X_train.values if hasattr(X_train, 'values') else X_train
-    X_q   = X_test.values  if hasattr(X_test,  'values') else X_test
-    X_fit = X_fit.astype(np.float32)
-    X_q   = X_q.astype(np.float32)
-    k     = LOF_N_NEIGHBORS
-
+    X_fit = np.ascontiguousarray(getattr(X_train, 'values', X_train), dtype=np.float32)
+    X_q = np.ascontiguousarray(getattr(X_test, 'values', X_test), dtype=np.float32)
+    k = LOF_N_NEIGHBORS
     log.info(f"LOF: fitting on ALL {len(X_fit):,} training rows (k={k})")
 
-    try:
+    knn_query, index = _make_knn(X_fit)
+    k_dist_fit, lrd_fit, dist_fit, idx_fit = _fit_lof_stats(knn_query, X_fit, k)
+    raw_train = _lof_from_neighbours(dist_fit, idx_fit, k_dist_fit, lrd_fit) - 1.0
+
+    if index is not None:
         import faiss
-        _use_faiss = True
-        log.info("LOF backend: FAISS IVFFlat (approximate, fast)")
-    except ImportError:
-        _use_faiss = False
-        log.info("LOF backend: sklearn BallTree (exact, slower — pip install faiss-cpu for speedup)")
-
-    lof_train_scores, lof_test_scores, faiss_index_or_none, knn_query_fn = \
-        _lof_scores_from_knn(X_fit, X_q, k)
-
-    # Raw LOF values: >1 means outlier. Negate so higher = more anomalous.
-    raw_train = lof_train_scores - 1.0   # centre at 0 for inliers
-    raw_test  = lof_test_scores  - 1.0
-
-    scaler = MinMaxScaler()
-    scaler.fit(raw_train.reshape(-1, 1))
-    scores_norm = np.clip(scaler.transform(raw_test.reshape(-1, 1)).ravel(), 0.0, 1.0)
-
-    # ── Build and save ApproximateLOFModel ──
-    # knn_query needed to get k_dist_fit for reach-distance at inference
-    X_fit32 = X_fit.astype(np.float32)
-    dist_fit_kdist, idx_fit = knn_query_fn(X_fit32, k)
-    k_dist_fit = dist_fit_kdist[:, -1]
-
-    # lrd_fit needed at inference
-    reach_dist_fit = np.maximum(dist_fit_kdist, k_dist_fit[idx_fit])
-    lrd_fit = 1.0 / (np.mean(reach_dist_fit, axis=1) + 1e-10)
-
-    if _use_faiss:
-        lof_model = ApproximateLOFModel(
-            lrd_fit=lrd_fit,
-            idx_fit_knn_query_fn=faiss_index_or_none,
-            k=k,
-            X_fit=X_fit32,
-            use_faiss=True,
-        )
+        model = ApproximateLOFModel(k, lrd_fit, k_dist_fit,
+                                    faiss_index_bytes=np.asarray(faiss.serialize_index(index)))
     else:
-        # For BallTree fallback, store X_fit so it can be rebuilt
-        lof_model = ApproximateLOFModel(
-            lrd_fit=lrd_fit,
-            idx_fit_knn_query_fn=None,  # not used for BallTree path
-            k=k,
-            X_fit=X_fit32,
-            use_faiss=False,
-        )
-    lof_model.fit_store_kdist(k_dist_fit)
+        model = ApproximateLOFModel(k, lrd_fit, k_dist_fit, X_fit=X_fit)
 
-    with open(LOF_MODEL_PATH, 'wb') as f:
-        pickle.dump(lof_model, f)
+    scaler = MinMaxScaler().fit(raw_train.reshape(-1, 1))
+    raw_test = -model.decision_function(X_q)          # = lof - 1
+    scores_norm = _minmax_apply(scaler, raw_test)
+
+    save_lof_model(model, LOF_MODEL_PATH)
     with open(LOF_SCALER_PATH, 'wb') as f:
         pickle.dump(scaler, f)
-
-    log.info(f"LOF trained on {len(X_fit):,} rows (was capped at 50k previously)")
     log.info(f"Saved LOF model  -> {LOF_MODEL_PATH}")
     log.info(f"Saved LOF scaler -> {LOF_SCALER_PATH}")
     return scores_norm
 
 
-# ─── Autoencoder (PyTorch) ───────────────────────────────────────────────────
+# ─── Autoencoder ─────────────────────────────────────────────────────────────
 
-class Autoencoder(nn.Module):
+def build_autoencoder(input_dim, hidden_dims):
     """
-    Symmetric autoencoder. C-01: AE_HIDDEN=[32,16,8,16,32]:
-      encoder: input -> 32 -> 16 -> 8  (bottleneck=8, 42% of 19 input dims)
-      decoder: 8 -> 16 -> 32 -> input
-    Was [16,8,4,8,16]: bottleneck=4 (21%) -> recall=0.262, missed 74% of fraud.
+    torch nn.Module: encoder input->32->16->8, decoder 8->16->32->input.
+    No output activation: targets are MinMax-scaled and can leave [0,1] on new data;
+    inputs and reconstructions are clipped to [0,1] before the MSE instead.
     """
-    def __init__(self, input_dim, hidden_dims):
-        super().__init__()
-        mid = len(hidden_dims) // 2
+    import torch.nn as nn
 
-        enc_layers = []
-        prev = input_dim
-        for h in hidden_dims[:mid + 1]:
-            enc_layers += [nn.Linear(prev, h), nn.ReLU()]
-            prev = h
-        self.encoder = nn.Sequential(*enc_layers)
+    class Autoencoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            mid = len(hidden_dims) // 2
+            enc, prev = [], input_dim
+            for h in hidden_dims[:mid + 1]:
+                enc += [nn.Linear(prev, h), nn.ReLU()]
+                prev = h
+            self.encoder = nn.Sequential(*enc)
+            dec = []
+            for h in hidden_dims[mid + 1:]:
+                dec += [nn.Linear(prev, h), nn.ReLU()]
+                prev = h
+            dec += [nn.Linear(prev, input_dim)]
+            self.decoder = nn.Sequential(*dec)
 
-        dec_layers = []
-        for h in hidden_dims[mid + 1:]:
-            dec_layers += [nn.Linear(prev, h), nn.ReLU()]
-            prev = h
-        # L-11: Removed Sigmoid -- it clamped output to [0,1] but MinMaxScaler
-        # can produce values outside [0,1] for test data. Sigmoid made those
-        # unreconstructable -> artificially inflated MSE -> false positives.
-        # Instead we clip inputs to [0,1] before MSE (see train_autoencoder/run_inference).
-        dec_layers += [nn.Linear(prev, input_dim)]
-        self.decoder = nn.Sequential(*dec_layers)
+        def forward(self, x):
+            return self.decoder(self.encoder(x))
 
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
+    return Autoencoder()
+
+
+def export_ae_weights(model, path=AE_WEIGHTS_PATH):
+    """Save Linear layers in forward order as W0,b0,W1,b1,... for the NumPy forward pass."""
+    import torch.nn as nn
+    arrays = {}
+    linears = [m for m in list(model.encoder) + list(model.decoder) if isinstance(m, nn.Linear)]
+    for i, lin in enumerate(linears):
+        arrays[f'W{i}'] = lin.weight.detach().cpu().numpy().astype(np.float32)
+        arrays[f'b{i}'] = lin.bias.detach().cpu().numpy().astype(np.float32)
+    np.savez(path, n_layers=len(linears), **arrays)
+
+
+def ae_forward_numpy(weights, X):
+    """ReLU after every layer except the last -- identical to build_autoencoder()."""
+    h = np.asarray(X, dtype=np.float32)
+    n = int(weights['n_layers'])
+    for i in range(n):
+        h = h @ weights[f'W{i}'].T + weights[f'b{i}']
+        if i < n - 1:
+            h = np.maximum(h, 0.0)
+    return h
+
+
+def ae_reconstruction_mse(weights, X_norm):
+    recon = ae_forward_numpy(weights, X_norm)
+    return np.mean((np.clip(X_norm, 0, 1) - np.clip(recon, 0, 1)) ** 2, axis=1)
 
 
 def train_autoencoder(X_train, X_test, y_train=None):
     """
-    FIX 9.9: Validation split + early stopping. FIX-02: MSE scaler. C-01: wider bottleneck.
-    C-05: If y_train provided, trains on NORMAL data only (y_train==0).
-          This is correct for anomaly detection -- AE learns to reconstruct normal patterns.
-          Fraud has high reconstruction error because model never saw it.
+    Trained on NORMAL rows only when y_train is given (semi-supervised anomaly
+    detection: the AE learns normal behaviour; fraud reconstructs poorly).
+    Early stopping on a held-out 10% of the (shuffled) training rows.
     """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+
     log.info("=== Autoencoder ===")
+    torch.manual_seed(RANDOM_SEED)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log.info(f"Device: {device}")
 
-    # C-05: Filter to normal-only training data
+    X_train = np.asarray(X_train, dtype=np.float32)
+    X_test = np.asarray(X_test, dtype=np.float32)
     if y_train is not None:
-        normal_mask = (y_train == 0).values if hasattr(y_train, 'values') else (y_train == 0)
+        normal_mask = np.asarray(y_train) == 0
         X_train_ae = X_train[normal_mask]
-        log.info(f"C-05: AE training on {len(X_train_ae):,} normal rows (excluded {(~normal_mask).sum():,} fraud)")
+        log.info(f"AE training on {len(X_train_ae):,} normal rows (excluded {(~normal_mask).sum():,} fraud)")
     else:
         X_train_ae = X_train
-        log.info(f"AE training on all {len(X_train_ae):,} rows (no labels provided)")
 
     input_dim = X_train_ae.shape[1]
-
     scaler = MinMaxScaler()
     X_train_norm = scaler.fit_transform(X_train_ae).astype(np.float32)
-    X_test_norm  = scaler.transform(X_test).astype(np.float32)
-
+    X_test_norm = scaler.transform(X_test).astype(np.float32)
     with open(AE_SCALER_PATH, 'wb') as f:
         pickle.dump(scaler, f)
-    log.info(f"Saved AE scaler -> {AE_SCALER_PATH}")
 
-    n_val = max(1, int(0.1 * len(X_train_norm)))
-    X_val_norm = X_train_norm[:n_val]
-    X_fit_norm = X_train_norm[n_val:]
+    rng = np.random.default_rng(RANDOM_SEED)
+    perm = rng.permutation(len(X_train_norm))
+    n_val = max(1, int(0.1 * len(perm)))
+    X_val_norm = X_train_norm[perm[:n_val]]
+    X_fit_norm = X_train_norm[perm[n_val:]]
 
-    train_tensor = torch.tensor(X_fit_norm)
-    val_tensor   = torch.tensor(X_val_norm)
-    loader = DataLoader(TensorDataset(train_tensor), batch_size=AE_BATCH_SIZE, shuffle=True)
-
-    model = Autoencoder(input_dim, AE_HIDDEN).to(device)
+    loader = DataLoader(TensorDataset(torch.tensor(X_fit_norm)), batch_size=AE_BATCH_SIZE, shuffle=True)
+    model = build_autoencoder(input_dim, AE_HIDDEN).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=AE_LR)
     criterion = nn.MSELoss()
+    val_t = torch.tensor(X_val_norm).to(device)
 
-    best_val_loss   = float('inf')
-    best_state_dict = None
-    patience        = AE_EARLY_STOP_PATIENCE
-    no_improve      = 0
-
+    best_val, best_state, no_improve = float('inf'), None, 0
     for epoch in range(AE_EPOCHS):
         model.train()
-        total_loss = 0
+        total = 0.0
         for (batch,) in loader:
             batch = batch.to(device)
-            recon = model(batch)
-            loss  = criterion(recon, batch)
+            loss = criterion(model(batch), batch)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-
+            total += loss.item()
         model.eval()
         with torch.no_grad():
-            val_recon = model(val_tensor.to(device)).cpu()
-            val_loss  = criterion(val_recon, torch.tensor(X_val_norm)).item()
-
+            val_loss = criterion(model(val_t), val_t).item()
         if (epoch + 1) % 5 == 0:
-            log.info(f"  Epoch {epoch+1:3d}/{AE_EPOCHS}  train={total_loss/len(loader):.6f}  val={val_loss:.6f}")
-
-        if val_loss < best_val_loss:
-            best_val_loss   = val_loss
-            best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
-            no_improve      = 0
+            log.info(f"  Epoch {epoch+1:3d}/{AE_EPOCHS}  train={total/len(loader):.6f}  val={val_loss:.6f}")
+        if val_loss < best_val:
+            best_val, no_improve = val_loss, 0
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             no_improve += 1
-            if no_improve >= patience:
-                log.info(f"  Early stopping at epoch {epoch+1} (no val improvement for {patience} epochs)")
+            if no_improve >= AE_EARLY_STOP_PATIENCE:
+                log.info(f"  Early stopping at epoch {epoch+1}")
                 break
-
-    if best_state_dict is not None:
-        model.load_state_dict(best_state_dict)
-        log.info(f"  Restored best checkpoint (val_loss={best_val_loss:.6f})")
-
-    model.eval()
-    with torch.no_grad():
-        X_t = torch.tensor(X_test_norm).to(device)
-        recon = model(X_t).cpu().numpy()
-    # L-11: Clip both target and reconstruction to [0,1] for fair MSE comparison.
-    # Without Sigmoid the decoder can output any range; clipping aligns them.
-    X_test_clipped = np.clip(X_test_norm, 0.0, 1.0)
-    recon_clipped  = np.clip(recon, 0.0, 1.0)
-    mse = np.mean((X_test_clipped - recon_clipped) ** 2, axis=1)
-
-    with torch.no_grad():
-        X_train_t = torch.tensor(X_fit_norm).to(device)
-        recon_train = model(X_train_t).cpu().numpy()
-    X_fit_clipped    = np.clip(X_fit_norm, 0.0, 1.0)
-    recon_tr_clipped = np.clip(recon_train, 0.0, 1.0)
-    mse_train = np.mean((X_fit_clipped - recon_tr_clipped) ** 2, axis=1)
-
-    mse_scaler = MinMaxScaler()
-    mse_scaler.fit(mse_train.reshape(-1, 1))
-
-    with open(AE_MSE_SCALER_PATH, 'wb') as f:
-        pickle.dump(mse_scaler, f)
-    log.info(f"Saved AE MSE scaler -> {AE_MSE_SCALER_PATH}")
-
-    mse_norm = np.clip(mse_scaler.transform(mse.reshape(-1, 1)).ravel(), 0.0, 1.0)
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval().cpu()
 
     torch.save(model.state_dict(), AE_MODEL_PATH)
-    log.info(f"Saved AE model -> {AE_MODEL_PATH}  (best val_loss={best_val_loss:.6f})")
-    return mse_norm
+    export_ae_weights(model, AE_WEIGHTS_PATH)
+    weights = dict(np.load(AE_WEIGHTS_PATH))
+
+    mse_train = ae_reconstruction_mse(weights, X_fit_norm)
+    mse_scaler = MinMaxScaler().fit(mse_train.reshape(-1, 1))
+    with open(AE_MSE_SCALER_PATH, 'wb') as f:
+        pickle.dump(mse_scaler, f)
+
+    mse_test = ae_reconstruction_mse(weights, X_test_norm)
+    log.info(f"Saved AE -> {AE_MODEL_PATH}, {AE_WEIGHTS_PATH}  (best val_loss={best_val:.6f})")
+    return _minmax_apply(mse_scaler, mse_test)
 
 
-# ─── L-06: Module-level model cache -- avoids re-loading from disk on every call ──
+# ─── Cached loaders (inference) ──────────────────────────────────────────────
 
 @functools.lru_cache(maxsize=1)
 def _load_if_cached():
@@ -473,131 +445,101 @@ def _load_if_cached():
         scaler = pickle.load(f)
     return model, scaler
 
+
 @functools.lru_cache(maxsize=1)
-def _load_ae_cached(input_dim):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ae = Autoencoder(input_dim, AE_HIDDEN).to(device)
-    ae.load_state_dict(torch.load(AE_MODEL_PATH, map_location=device, weights_only=True))
-    ae.eval()
+def _load_ae_cached():
+    if not os.path.exists(AE_WEIGHTS_PATH) and os.path.exists(AE_MODEL_PATH):
+        # One-off conversion from an older torch checkpoint (needs torch locally).
+        import torch
+        with open(AE_SCALER_PATH, 'rb') as f:
+            input_dim = pickle.load(f).n_features_in_
+        m = build_autoencoder(input_dim, AE_HIDDEN)
+        m.load_state_dict(torch.load(AE_MODEL_PATH, map_location='cpu', weights_only=True))
+        export_ae_weights(m, AE_WEIGHTS_PATH)
+    weights = dict(np.load(AE_WEIGHTS_PATH))
     with open(AE_SCALER_PATH, 'rb') as f:
         scaler = pickle.load(f)
     with open(AE_MSE_SCALER_PATH, 'rb') as f:
         mse_scaler = pickle.load(f)
-    return ae, scaler, mse_scaler, device
+    return weights, scaler, mse_scaler
+
 
 @functools.lru_cache(maxsize=1)
 def _load_lof_cached():
-    # FIX: pickle stored ApproximateLOFModel as __main__.ApproximateLOFModel
-    # when models.py was run directly. Inject into __main__ so unpickling works
-    # regardless of entry point (streamlit, script, etc.)
-    import sys as _sys
-    if not hasattr(_sys.modules.get('__main__', None), 'ApproximateLOFModel'):
-        import types as _types
-        _main = _sys.modules.setdefault('__main__', _types.ModuleType('__main__'))
-        _main.ApproximateLOFModel = ApproximateLOFModel
-    with open(LOF_MODEL_PATH, 'rb') as f:
-        lof_model = pickle.load(f)
+    lof_model = load_lof_model(LOF_MODEL_PATH)
     with open(LOF_SCALER_PATH, 'rb') as f:
         scaler = pickle.load(f)
-    # Rebuild the kNN query function (FAISS index or BallTree) after unpickling.
-    if hasattr(lof_model, '_build_query_fn'):
-        lof_model._build_query_fn()
+    lof_model._build_query_fn()
     return lof_model, scaler
 
 
-# ─── Run inference on new data (used by app.py) ──────────────────────────────
+# ─── Inference ───────────────────────────────────────────────────────────────
+
+def score_if(X):
+    model, scaler = _load_if_cached()
+    return _minmax_apply(scaler, -model.decision_function(X))
+
+
+def score_ae(X):
+    weights, scaler, mse_scaler = _load_ae_cached()
+    X_norm = scaler.transform(X).astype(np.float32)
+    return _minmax_apply(mse_scaler, ae_reconstruction_mse(weights, X_norm))
+
+
+def score_lof(X):
+    lof_model, scaler = _load_lof_cached()
+    return _minmax_apply(scaler, -lof_model.decision_function(X))
+
+
+def score_all(X, weights=None):
+    """Component scores + ensemble for a feature matrix (n, 23)."""
+    weights = weights or ENSEMBLE_WEIGHTS
+    X = np.asarray(X, dtype=np.float32)
+    s = {'if': score_if(X), 'ae': score_ae(X), 'lof': score_lof(X)}
+    s['ensemble'] = weights['if'] * s['if'] + weights['ae'] * s['ae'] + weights['lof'] * s['lof']
+    return s
+
 
 def run_inference(df: pd.DataFrame, model_name: str = 'Isolation Forest', threshold: float = 0.85):
-    """
-    Given a preprocessed DataFrame, return a copy with 'anomaly_score'
-    and 'is_fraud' columns.
-    L-06: Uses module-level LRU-cached model loaders to avoid redundant disk I/O.
-    """
+    """Return a copy of df with 'anomaly_score' and 'is_fraud' columns."""
     X = df.values.astype(np.float32)
-
     if model_name == 'Isolation Forest':
-        model, scaler = _load_if_cached()
-        raw = -model.decision_function(X)
-        scores = np.clip(scaler.transform(raw.reshape(-1, 1)).ravel(), 0.0, 1.0)
-
+        scores = score_if(X)
     elif model_name == 'Autoencoder':
-        ae, scaler, mse_scaler, device = _load_ae_cached(X.shape[1])
-        X_norm = scaler.transform(X).astype(np.float32)
-        with torch.no_grad():
-            recon = ae(torch.tensor(X_norm).to(device)).cpu().numpy()
-        # L-11: Clip to [0,1] for fair MSE -- decoder no longer has Sigmoid
-        X_clipped = np.clip(X_norm, 0.0, 1.0)
-        recon_clipped = np.clip(recon, 0.0, 1.0)
-        mse = np.mean((X_clipped - recon_clipped) ** 2, axis=1)
-        scores = np.clip(mse_scaler.transform(mse.reshape(-1, 1)).ravel(), 0.0, 1.0)
-
+        scores = score_ae(X)
     elif model_name == 'LOF':
-        lof_model, scaler = _load_lof_cached()
-        raw = -lof_model.decision_function(X)
-        scores = np.clip(scaler.transform(raw.reshape(-1, 1)).ravel(), 0.0, 1.0)
-
+        scores = score_lof(X)
     elif model_name == 'Ensemble':
-        if_model, if_scaler = _load_if_cached()
-        raw_if = -if_model.decision_function(X)
-        if_sc  = np.clip(if_scaler.transform(raw_if.reshape(-1, 1)).ravel(), 0, 1)
-
-        ae, ae_scaler, ae_mse_scaler, device = _load_ae_cached(X.shape[1])
-        X_norm = ae_scaler.transform(X).astype(np.float32)
-        with torch.no_grad():
-            recon = ae(torch.tensor(X_norm).to(device)).cpu().numpy()
-        X_clipped = np.clip(X_norm, 0.0, 1.0)
-        recon_clipped = np.clip(recon, 0.0, 1.0)
-        mse = np.mean((X_clipped - recon_clipped) ** 2, axis=1)
-        ae_sc = np.clip(ae_mse_scaler.transform(mse.reshape(-1, 1)).ravel(), 0.0, 1.0)
-
-        lof_model, lof_scaler = _load_lof_cached()
-        raw_lof = -lof_model.decision_function(X)
-        lof_sc  = np.clip(lof_scaler.transform(raw_lof.reshape(-1, 1)).ravel(), 0, 1)
-
-        scores = (
-            ENSEMBLE_WEIGHTS['if']  * if_sc +
-            ENSEMBLE_WEIGHTS['ae']  * ae_sc +
-            ENSEMBLE_WEIGHTS['lof'] * lof_sc
-        )
-
+        scores = score_all(X)['ensemble']
     else:
         raise ValueError(f"Unknown model: {model_name}")
-
     result = df.copy()
     result['anomaly_score'] = scores
     result['is_fraud'] = scores >= threshold
     return result
 
 
-# ─── Train all + save combined scores ────────────────────────────────────────
+# ─── Train all + save combined test scores ───────────────────────────────────
 
 def train_all(X_train, X_test, y_train=None):
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
-
-    if_scores  = train_isolation_forest(X_train, X_test)
+    if_scores = train_isolation_forest(X_train, X_test)
     lof_scores = train_lof(X_train, X_test)
-    ae_scores  = train_autoencoder(X_train, X_test, y_train=y_train)  # C-05: normal-only
+    ae_scores = train_autoencoder(X_train, X_test, y_train=y_train)
+    _load_if_cached.cache_clear(); _load_ae_cached.cache_clear(); _load_lof_cached.cache_clear()
 
-    ensemble_scores = (
-        ENSEMBLE_WEIGHTS['if']  * if_scores +
-        ENSEMBLE_WEIGHTS['ae']  * ae_scores +
-        ENSEMBLE_WEIGHTS['lof'] * lof_scores
-    )
-
-    scores_df = pd.DataFrame({
-        'if_score':       if_scores,
-        'lof_score':      lof_scores,
-        'ae_score':       ae_scores,
-        'ensemble_score': ensemble_scores,
-    })
+    ensemble = (ENSEMBLE_WEIGHTS['if'] * if_scores + ENSEMBLE_WEIGHTS['ae'] * ae_scores
+                + ENSEMBLE_WEIGHTS['lof'] * lof_scores)
+    scores_df = pd.DataFrame({'if_score': if_scores, 'lof_score': lof_scores,
+                              'ae_score': ae_scores, 'ensemble_score': ensemble})
     scores_df.to_csv(ANOMALY_SCORES_PATH, index=False)
-    log.info(f"Saved all scores -> {ANOMALY_SCORES_PATH}")
+    log.info(f"Saved all scores -> {ANOMALY_SCORES_PATH} (ensemble re-weighted by tune.py)")
     return scores_df
 
 
 if __name__ == '__main__':
     from data_processing import load_and_clean
     X_train, X_test, y_train, y_test, X_val, y_val = load_and_clean()
-    scores = train_all(X_train, X_test, y_train=y_train)  # C-05: pass y_train
+    scores = train_all(X_train, X_test, y_train=y_train)
     print("\nAll models trained.")
     print(scores.describe())

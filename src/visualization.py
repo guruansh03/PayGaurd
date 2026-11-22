@@ -48,7 +48,7 @@ def get_pca_plot(X_test: pd.DataFrame = None, scores: pd.Series = None, threshol
         threshold = THRESHOLD
     if X_test is None or scores is None:
         s, X_test, _ = _load()
-        scores = s['if_score']
+        scores = s['ensemble_score']
 
     pca = PCA(n_components=2, random_state=42)
     coords = pca.fit_transform(X_test)
@@ -80,7 +80,7 @@ def get_tsne_plot(X_test: pd.DataFrame = None, scores: pd.Series = None, sample_
         threshold = THRESHOLD
     if X_test is None or scores is None:
         s, X_test, _ = _load()
-        scores = s['if_score']
+        scores = s['ensemble_score']
 
     # t-SNE is slow -- subsample for speed
     if len(X_test) > sample_n:
@@ -132,7 +132,7 @@ def get_score_dist_plot(scores: pd.DataFrame = None):
             ))
 
     fig.add_vline(x=THRESHOLD, line_dash='dash', line_color='black',
-                  annotation_text=f'Threshold={THRESHOLD}')
+                  annotation_text=f'Ensemble threshold={THRESHOLD:.2f}')
     fig.update_layout(
         barmode='overlay',
         title='Anomaly Score Distribution',
@@ -151,7 +151,7 @@ def save_score_dist():
 
 # ─── 4. Confusion matrix ─────────────────────────────────────────────────────
 
-def save_confusion_matrix(score_col='if_score'):
+def save_confusion_matrix(score_col='ensemble_score'):
     scores, _, y_true = _load()
     y_pred = (scores[score_col] >= THRESHOLD).astype(int)
     cm = confusion_matrix(y_true, y_pred)
@@ -162,7 +162,7 @@ def save_confusion_matrix(score_col='if_score'):
                 yticklabels=['Normal', 'Fraud'])
     ax.set_xlabel('Predicted')
     ax.set_ylabel('Actual')
-    ax.set_title('Confusion Matrix -- Isolation Forest')
+    ax.set_title(f'Confusion Matrix -- Ensemble (test, threshold={THRESHOLD:.2f})')
     plt.tight_layout()
 
     path = os.path.join(CHARTS_DIR, 'confusion_matrix.png')

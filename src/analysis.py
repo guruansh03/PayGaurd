@@ -20,21 +20,23 @@ import os
 import sys
 import pickle
 import numpy as np
-from models import ApproximateLOFModel  # needed so pickle can deserialise the LOF model
 import pandas as pd
 from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     ANOMALY_SCORES_PATH, X_TEST_PATH, Y_TEST_PATH,
     IF_MODEL_PATH, AE_MODEL_PATH, AE_SCALER_PATH,
-    AE_HIDDEN, THRESHOLD, OUTPUTS_DIR,
+    AE_HIDDEN, OUTPUTS_DIR, MODEL_THRESHOLDS,
 )
+from models import build_autoencoder, load_lof_model
 
 
 def evaluate_model(scores: pd.Series, y_true: np.ndarray, name: str):
-    print(f"\n=== {name} ===")
-    y_pred = (scores >= THRESHOLD).astype(int)
+    threshold = MODEL_THRESHOLDS[name]          # each model uses its own tuned threshold
+    print(f"\n=== {name} (threshold={threshold:.2f}) ===")
+    y_pred = (scores >= threshold).astype(int)
     print(classification_report(y_true, y_pred, target_names=['Normal', 'Fraud']))
     try:
         auc = roc_auc_score(y_true, scores)
@@ -86,7 +88,6 @@ def run_ae_saliency(X_test: pd.DataFrame):
     try:
         import torch
         import torch.nn as nn
-        from src.models import Autoencoder
     except ImportError as e:
         print(f"Skipping AE saliency: {e}")
         return None
@@ -99,7 +100,7 @@ def run_ae_saliency(X_test: pd.DataFrame):
 
     X_norm = scaler.transform(X_test.values).astype(np.float32)
 
-    ae = Autoencoder(input_dim, AE_HIDDEN).to(device)
+    ae = build_autoencoder(input_dim, AE_HIDDEN).to(device)
     ae.load_state_dict(torch.load(AE_MODEL_PATH, map_location=device,
                                   weights_only=True))
     ae.eval()
@@ -151,8 +152,7 @@ def run_lof_importance(X_test: pd.DataFrame):
         print("lof_model.pkl not found — run models.py first")
         return None
 
-    with open(lof_path, 'rb') as f:
-        lof_model = _pkl.load(f)
+    lof_model = load_lof_model(lof_path)
     with open(lof_scaler_path, 'rb') as f:
         lof_scaler = _pkl.load(f)
 

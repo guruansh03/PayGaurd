@@ -34,11 +34,12 @@ from sklearn.preprocessing import MinMaxScaler
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
-    DATA_PATH, RANDOM_SEED, TEST_SIZE,
+    DATA_PATH, RANDOM_SEED,
     OUTPUTS_DIR, X_TEST_PATH, Y_TEST_PATH, SENDER_STATS_PATH, RECEIVER_STATS_PATH,
-    CONTAMINATION, THRESHOLD,
+    CONTAMINATION, IF_THRESHOLD, LOF_THRESHOLD,
     X_VAL_PATH, Y_VAL_PATH,
 )
+from models import _lof_scores_from_knn
 
 FEATURE_COLS = [
     'amount', 'amount_log', 'amount_vs_sender_avg', 'is_round_amount',
@@ -171,7 +172,7 @@ def load_and_clean():
     try:
         from velocity_store import VelocityStore
         store = VelocityStore()
-        store.build_from_training(df)
+        store.build_from_training(df)   # demo history for live lookups (not used in metrics)
         print(f"Velocity store built -> outputs/velocity.db")
     except Exception as e:
         print(f"Warning: velocity store build failed ({e}) -- inference will fall back to sender_stats")
@@ -181,19 +182,18 @@ def load_and_clean():
 
 # ── 5-fold cross-validation evaluation (FIX 9.10) ────────────────────────────
 
-def evaluate_cv(X, y, n_splits=5, threshold=None):
+def evaluate_cv(X, y, n_splits=5, thresholds=None):
     """
-    C-08: 5-fold StratifiedKFold for IF and LOF.
-    C-09: Score scaler fitted on TRAINING fold, transforms VAL fold.
-    FIX-07: threshold parameterized.
+    5-fold StratifiedKFold for IF and LOF on the train+val rows (test untouched).
+    Feature scaler and score scaler are both fitted inside each training fold.
+    ROC-AUC is threshold-free; P/R/F1 use the per-model thresholds.
     """
-    if threshold is None:
-        threshold = THRESHOLD
-
-    from sklearn.neighbors import LocalOutlierFactor
+    thresholds = thresholds or {'Isolation Forest': IF_THRESHOLD, 'LOF': LOF_THRESHOLD}
+    results = {}
 
     for model_name in ['Isolation Forest', 'LOF']:
-        print(f"\n=== 5-Fold Stratified CV -- {model_name} ===")
+        threshold = thresholds[model_name]
+        print(f"\n=== 5-Fold Stratified CV -- {model_name} (threshold={threshold:.2f}) ===")
         kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
 
         precisions, recalls, f1s, aucs = [], [], [], []
@@ -213,14 +213,11 @@ def evaluate_cv(X, y, n_splits=5, threshold=None):
                 model.fit(X_tr_s)
                 raw_train_scores = -model.decision_function(X_tr_s)
                 raw_val_scores   = -model.decision_function(X_val_s)
-            else:  # LOF
-                # Evaluate LOF on the full training fold.
-                X_lof_fit = X_tr_s
-                model = LocalOutlierFactor(
-                    n_neighbors=20, algorithm='ball_tree', novelty=True, n_jobs=-1)
-                model.fit(X_lof_fit)
-                raw_train_scores = -model.decision_function(X_lof_fit)
-                raw_val_scores   = -model.decision_function(X_val_s)
+            else:  # LOF — FAISS-backed approximate kNN (same as production model)
+                lof_train_scores, lof_val_scores, _, _ = _lof_scores_from_knn(
+                    X_tr_s.astype(np.float32), X_val_s.astype(np.float32), k=20)
+                raw_train_scores = lof_train_scores - 1.0   # centre at 0 for inliers
+                raw_val_scores   = lof_val_scores  - 1.0
 
             # C-09: Fit score scaler on TRAINING fold scores, transform val fold
             score_scaler = MinMaxScaler()
@@ -247,18 +244,19 @@ def evaluate_cv(X, y, n_splits=5, threshold=None):
               f"  Recall={float(pd.Series(recalls).std()):.3f}"
               f"  F1={float(pd.Series(f1s).std()):.3f}"
               f"  AUC={float(pd.Series(aucs).std()):.4f}")
-    return {'precision': precisions, 'recall': recalls, 'f1': f1s, 'auc': aucs}
+        results[model_name] = {'precision': precisions, 'recall': recalls, 'f1': f1s, 'auc': aucs}
+    return results
 
 
 if __name__ == '__main__':
+    import json
     X_train, X_test, y_train, y_test, X_val, y_val = load_and_clean()
     print("\nData processing complete.")
 
-    # Run CV on the full labelled dataset (labels used for eval only, not training)
-    full_df = pd.read_csv(DATA_PATH)
-    from sklearn.preprocessing import StandardScaler as SS
-    X_all = full_df[FEATURE_COLS].copy()
-    ss = SS()
-    X_all[SCALE_COLS] = ss.fit_transform(X_all[SCALE_COLS])
-    y_all = full_df['fraud']
-    evaluate_cv(X_all, y_all)
+    # CV on train+val only (test split stays untouched for the final report).
+    # Labels are used for evaluation only, never for fitting IF/LOF.
+    X_cv = pd.concat([X_train, X_val]).reset_index(drop=True)
+    y_cv = pd.concat([y_train, y_val]).reset_index(drop=True)
+    cv = evaluate_cv(X_cv, y_cv)
+    with open(os.path.join(OUTPUTS_DIR, 'cv_results.json'), 'w') as f:
+        json.dump(cv, f, indent=2)
